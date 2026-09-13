@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec uv run --project "$REPO_ROOT" ybs "$@"
