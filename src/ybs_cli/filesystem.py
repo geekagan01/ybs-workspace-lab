@@ -66,7 +66,8 @@ def atomic_write(path: Path, content: bytes) -> None:
     except OSError as exc:
         _close_quietly(temporary_descriptor)
         if temporary_name is not None and temporary_identity is not None and parent_descriptor >= 0:
-            _unlink_if_same_file_at(parent_descriptor, temporary_name, temporary_identity)
+            with suppress(OSError):
+                _unlink_if_same_file_at(parent_descriptor, temporary_name, temporary_identity)
         raise YbsError(f"atomic write failed for {path}: {exc}", 5) from exc
     finally:
         _close_quietly(parent_descriptor)
@@ -140,7 +141,11 @@ def _open_directory(path: Path) -> int:
                 _DIRECTORY_OPEN_FLAGS,
                 dir_fd=descriptor,
             )
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                _close_quietly(child_descriptor)
+                raise
             descriptor = child_descriptor
     except BaseException:
         _close_quietly(descriptor)
@@ -179,7 +184,13 @@ def _owner_record() -> bytes:
     return json.dumps(metadata, separators=(",", ":")).encode()
 
 
-def _create_lock(directory_descriptor: int, lock_name: str, owner_bytes: bytes) -> bool:
+def _create_lock(
+    directory_descriptor: int,
+    lock_name: str,
+    owner_bytes: bytes,
+    *,
+    recovery_guard_held: bool = False,
+) -> bool:
     try:
         file_descriptor = os.open(
             lock_name,
@@ -202,7 +213,12 @@ def _create_lock(directory_descriptor: int, lock_name: str, owner_bytes: bytes) 
     except OSError as exc:
         _close_quietly(file_descriptor)
         if identity is not None:
-            _unlink_if_same_file_at(directory_descriptor, lock_name, identity)
+            with suppress(OSError):
+                if recovery_guard_held:
+                    _unlink_if_same_file_at(directory_descriptor, lock_name, identity)
+                else:
+                    with _recovery_guard(directory_descriptor, lock_name):
+                        _unlink_if_same_file_at(directory_descriptor, lock_name, identity)
         raise YbsError(f"task lock unavailable: {lock_name}: {exc}", 5) from exc
     return True
 
@@ -217,28 +233,39 @@ def _write_all(file_descriptor: int, content: bytes) -> None:
 
 
 def _recover_and_create_lock(directory_descriptor: int, lock_name: str, owner_bytes: bytes) -> bool:
-    guard_name = f".{lock_name}.recovery"
     try:
-        guard_descriptor = os.open(
-            guard_name,
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=directory_descriptor,
-        )
-        try:
-            fcntl.flock(guard_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            _close_quietly(guard_descriptor)
-            raise
+        with _recovery_guard(directory_descriptor, lock_name):
+            if _create_lock(
+                directory_descriptor,
+                lock_name,
+                owner_bytes,
+                recovery_guard_held=True,
+            ):
+                return True
+            if not _recover_dead_local_owner(directory_descriptor, lock_name):
+                return False
+            return _create_lock(
+                directory_descriptor,
+                lock_name,
+                owner_bytes,
+                recovery_guard_held=True,
+            )
     except OSError as exc:
         raise YbsError(f"task lock unavailable: {lock_name}: {exc}", 5) from exc
 
+
+@contextmanager
+def _recovery_guard(directory_descriptor: int, lock_name: str) -> Iterator[None]:
+    guard_name = f".{lock_name}.recovery"
+    guard_descriptor = os.open(
+        guard_name,
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_descriptor,
+    )
     try:
-        if _create_lock(directory_descriptor, lock_name, owner_bytes):
-            return True
-        if not _recover_dead_local_owner(directory_descriptor, lock_name):
-            return False
-        return _create_lock(directory_descriptor, lock_name, owner_bytes)
+        fcntl.flock(guard_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
     finally:
         _close_quietly(guard_descriptor)
 
@@ -268,7 +295,10 @@ def _recover_dead_local_owner(directory_descriptor: int, lock_name: str) -> bool
         return False
     if current_bytes != observed_bytes or current_identity != observed_identity:
         return False
-    return _unlink_if_same_file_at(directory_descriptor, lock_name, observed_identity)
+    try:
+        return _unlink_if_same_file_at(directory_descriptor, lock_name, observed_identity)
+    except OSError:
+        return False
 
 
 def _read_file_at(directory_descriptor: int, name: str) -> tuple[bytes, tuple[int, int]]:
@@ -286,21 +316,19 @@ def _read_file_at(directory_descriptor: int, name: str) -> tuple[bytes, tuple[in
 def _unlink_if_same_file_at(
     directory_descriptor: int, name: str, identity: tuple[int, int]
 ) -> bool:
-    try:
-        current = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != identity:
-            return False
-        os.unlink(name, dir_fd=directory_descriptor)
-    except OSError:
+    current = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != identity:
         return False
+    os.unlink(name, dir_fd=directory_descriptor)
     return True
 
 
 def _release_if_owned(directory_descriptor: int, lock_name: str, owner_bytes: bytes) -> None:
     try:
-        current_bytes, current_identity = _read_file_at(directory_descriptor, lock_name)
-        if current_bytes == owner_bytes:
-            _unlink_if_same_file_at(directory_descriptor, lock_name, current_identity)
+        with _recovery_guard(directory_descriptor, lock_name):
+            current_bytes, current_identity = _read_file_at(directory_descriptor, lock_name)
+            if current_bytes == owner_bytes:
+                _unlink_if_same_file_at(directory_descriptor, lock_name, current_identity)
     except FileNotFoundError:
         return
     except OSError as exc:

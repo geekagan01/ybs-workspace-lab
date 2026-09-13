@@ -3,12 +3,14 @@ import json
 import os
 import socket
 import threading
+from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
+import ybs_cli.filesystem as filesystem
 from ybs_cli.errors import YbsError
 from ybs_cli.filesystem import atomic_write, resolve_inside, task_lock
 
@@ -133,6 +135,59 @@ def test_atomic_write_stays_bound_to_open_parent_when_path_is_swapped(
 
     assert (moved_parent / "status.yaml").read_bytes() == b"stage: clarify\n"
     assert (outside / "status.yaml").read_bytes() == b"outside\n"
+
+
+def test_atomic_write_closes_child_directory_when_parent_descriptor_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "status.yaml"
+    real_open = os.open
+    real_close = os.close
+    real_fstat = os.fstat
+    directory_descriptors: list[int] = []
+    close_failure_injected = False
+
+    def record_directory_descriptor(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if flags & os.O_DIRECTORY:
+            directory_descriptors.append(descriptor)
+        return descriptor
+
+    def fail_first_parent_close(descriptor: int) -> None:
+        nonlocal close_failure_injected
+        if (
+            directory_descriptors
+            and descriptor == directory_descriptors[0]
+            and not close_failure_injected
+        ):
+            close_failure_injected = True
+            raise OSError("close unavailable")
+        real_close(descriptor)
+
+    with monkeypatch.context() as context:
+        context.setattr(os, "open", record_directory_descriptor)
+        context.setattr(os, "close", fail_first_parent_close)
+        with pytest.raises(YbsError, match="atomic write failed") as exc_info:
+            atomic_write(target, b"stage: intake\n")
+
+    assert exc_info.value.code == 5
+    assert close_failure_injected
+    assert len(directory_descriptors) >= 2
+    try:
+        for descriptor in directory_descriptors[:2]:
+            with pytest.raises(OSError) as closed_error:
+                real_fstat(descriptor)
+            assert closed_error.value.errno == errno.EBADF
+    finally:
+        for descriptor in directory_descriptors:
+            with suppress(OSError):
+                real_close(descriptor)
 
 
 def test_task_lock_rejects_invalid_task_id_before_creating_lock_directory(
@@ -289,6 +344,7 @@ def test_task_lock_serializes_two_contenders_recovering_same_stale_lock(
         "created_at": "2026-09-13T00:00:00+00:00",
     }
     lock_path.write_text(json.dumps(stale_owner))
+    (lock_path.parent / ".DEMO-101.lock.recovery").write_bytes(b"")
 
     real_kill = os.kill
 
@@ -299,50 +355,37 @@ def test_task_lock_serializes_two_contenders_recovering_same_stale_lock(
 
     monkeypatch.setattr(os, "kill", report_only_stale_process_dead)
 
-    real_read_bytes = Path.read_bytes
-    read_condition = threading.Condition()
-    reads_by_thread: dict[int, int] = {}
-    second_read_count = 0
-    contender_outcome = threading.Event()
+    real_flock = filesystem.fcntl.flock
+    guard_arrival_barrier = threading.Barrier(2)
+    guard_result = threading.Event()
+    guard_arrival_mutex = threading.Lock()
+    guard_arrivals = 0
 
-    def synchronize_stale_comparison(path: Path) -> bytes:
-        nonlocal second_read_count
-        contents = real_read_bytes(path)
-        if path == lock_path:
-            thread_id = threading.get_ident()
-            with read_condition:
-                reads_by_thread[thread_id] = reads_by_thread.get(thread_id, 0) + 1
-                if reads_by_thread[thread_id] == 2:
-                    second_read_count += 1
-                    read_condition.notify_all()
-                    assert read_condition.wait_for(
-                        lambda: second_read_count == 2 or contender_outcome.is_set(), timeout=2
-                    )
-        return contents
+    def synchronize_guard_acquisition(descriptor: int, operation: int) -> None:
+        nonlocal guard_arrivals
+        if operation != filesystem.fcntl.LOCK_EX | filesystem.fcntl.LOCK_NB:
+            real_flock(descriptor, operation)
+            return
+        with guard_arrival_mutex:
+            if guard_arrivals >= 2:
+                real_flock(descriptor, operation)
+                return
+            guard_arrivals += 1
+        guard_arrival_barrier.wait(timeout=2)
+        try:
+            real_flock(descriptor, operation)
+        except OSError:
+            guard_result.set()
+            raise
+        assert guard_result.wait(timeout=2)
 
-    monkeypatch.setattr(Path, "read_bytes", synchronize_stale_comparison)
-
-    real_unlink = Path.unlink
-    unlink_mutex = threading.Lock()
-    recovery_unlink_count = 0
-    first_owner_entered = threading.Event()
-
-    def delay_second_recovery_unlink(path: Path, *args: object, **kwargs: object) -> None:
-        nonlocal recovery_unlink_count
-        if path == lock_path:
-            with unlink_mutex:
-                recovery_unlink_count += 1
-                unlink_number = recovery_unlink_count
-            if unlink_number == 2:
-                assert first_owner_entered.wait(timeout=2)
-        real_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "unlink", delay_second_recovery_unlink)
+    monkeypatch.setattr(filesystem.fcntl, "flock", synchronize_guard_acquisition)
 
     result_mutex = threading.Lock()
     entered: list[str] = []
     errors: list[BaseException] = []
     overlap = threading.Event()
+    contender_outcome = threading.Event()
 
     def contend(name: str) -> None:
         try:
@@ -353,15 +396,12 @@ def test_task_lock_serializes_two_contenders_recovering_same_stale_lock(
                     if not first:
                         overlap.set()
                         contender_outcome.set()
-                first_owner_entered.set()
                 if first:
                     assert contender_outcome.wait(timeout=2)
         except BaseException as exc:
             with result_mutex:
                 errors.append(exc)
             contender_outcome.set()
-            with read_condition:
-                read_condition.notify_all()
 
     contenders = [threading.Thread(target=contend, args=(name,)) for name in ("A", "B")]
     for contender in contenders:
@@ -375,6 +415,8 @@ def test_task_lock_serializes_two_contenders_recovering_same_stale_lock(
     assert len(errors) == 1
     assert isinstance(errors[0], YbsError)
     assert errors[0].code == 5
+    assert guard_arrivals == 2
+    assert guard_result.is_set()
 
 
 def test_task_lock_never_recovers_remote_host_lock(
@@ -452,3 +494,79 @@ def test_task_lock_release_preserves_replaced_owner_record(tmp_path: Path) -> No
         lock_path.write_bytes(replacement)
 
     assert lock_path.read_bytes() == replacement
+
+
+def test_task_lock_release_maps_owned_lock_unlink_failure_to_operational_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / ".ybs" / "locks" / "DEMO-101.lock"
+    real_unlink = os.unlink
+
+    def reject_lock_release(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if os.fspath(path) == "DEMO-101.lock":
+            raise PermissionError("release denied")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", reject_lock_release)
+
+    with (
+        pytest.raises(YbsError, match="task lock release failed") as exc_info,
+        task_lock(tmp_path, "DEMO-101"),
+    ):
+        pass
+
+    assert exc_info.value.code == 5
+    assert lock_path.exists()
+
+
+def test_task_lock_release_does_not_delete_while_recovery_guard_is_held(tmp_path: Path) -> None:
+    locks_directory = tmp_path / ".ybs" / "locks"
+    locks_directory.mkdir(parents=True)
+    lock_path = locks_directory / "DEMO-101.lock"
+    guard_path = locks_directory / ".DEMO-101.lock.recovery"
+    guard_descriptor = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o600)
+    filesystem.fcntl.flock(guard_descriptor, filesystem.fcntl.LOCK_EX | filesystem.fcntl.LOCK_NB)
+
+    try:
+        with (
+            pytest.raises(YbsError, match="task lock release failed") as exc_info,
+            task_lock(tmp_path, "DEMO-101"),
+        ):
+            pass
+
+        assert exc_info.value.code == 5
+        assert lock_path.exists()
+    finally:
+        os.close(guard_descriptor)
+
+
+def test_task_lock_failed_create_does_not_delete_while_recovery_guard_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    locks_directory = tmp_path / ".ybs" / "locks"
+    locks_directory.mkdir(parents=True)
+    lock_path = locks_directory / "DEMO-101.lock"
+    guard_path = locks_directory / ".DEMO-101.lock.recovery"
+    guard_descriptor = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o600)
+    filesystem.fcntl.flock(guard_descriptor, filesystem.fcntl.LOCK_EX | filesystem.fcntl.LOCK_NB)
+
+    def fail_lock_write(descriptor: int, content: bytes) -> int:
+        raise OSError("write unavailable")
+
+    monkeypatch.setattr(os, "write", fail_lock_write)
+
+    try:
+        with (
+            pytest.raises(YbsError, match="task lock unavailable") as exc_info,
+            task_lock(tmp_path, "DEMO-101"),
+        ):
+            pass
+
+        assert exc_info.value.code == 5
+        assert lock_path.exists()
+    finally:
+        os.close(guard_descriptor)
