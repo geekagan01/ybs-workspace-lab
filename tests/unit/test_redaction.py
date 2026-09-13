@@ -74,3 +74,15 @@ def test_redact_explicit_secret_in_malformed_url_like_text() -> None:
     value = "http://[broken/needle"
 
     assert redact(value, secrets=["needle"]) == "http://[broken/***REDACTED***"
+
+
+@pytest.mark.parametrize(
+    "secrets",
+    [
+        ["top", "top-secret"],
+        ["secret", "top-secret"],
+        ["top", "top-secret", "top-secret"],
+    ],
+)
+def test_redact_prefers_longest_overlapping_explicit_secret(secrets: list[str]) -> None:
+    assert redact("Bearer top-secret", secrets=secrets) == "Bearer ***REDACTED***"

@@ -8,7 +8,9 @@ _SENSITIVE_KEY = re.compile(r"(?:authorization|token|secret|password|api[_-]?key
 
 def redact(value: object, secrets: Sequence[str] = ()) -> object:
     """Return a safely renderable form of a potentially sensitive value."""
-    explicit_secrets = tuple(secret for secret in secrets if secret)
+    explicit_secrets = tuple(
+        sorted(dict.fromkeys(secret for secret in secrets if secret), key=len, reverse=True)
+    )
     return _redact_value(value, explicit_secrets)
 
 
