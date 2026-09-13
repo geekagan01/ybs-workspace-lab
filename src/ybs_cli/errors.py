@@ -1,5 +1,5 @@
 class YbsError(Exception):
-    """An expected operational failure with a stable process exit code."""
+    """An expected user-facing failure with a stable process exit code."""
 
     def __init__(self, message: str, code: int) -> None:
         super().__init__(message)
