@@ -447,19 +447,39 @@ def test_task_lock_never_recovers_remote_host_lock(
     assert lock_path.read_bytes() == original_bytes
 
 
-def test_task_lock_never_recovers_malformed_lock(tmp_path: Path) -> None:
+def test_task_lock_never_recovers_unavailable_lock_records(tmp_path: Path) -> None:
     lock_path = tmp_path / ".ybs" / "locks" / "DEMO-101.lock"
     lock_path.parent.mkdir(parents=True)
-    lock_path.write_bytes(b"not-json")
+    unavailable_records = [
+        ("[" * 2_000 + "0" + "]" * 2_000).encode(),
+        b"not-json",
+        (
+            b'{"pid":'
+            + b"9" * 5_000
+            + b',"host":'
+            + json.dumps(socket.gethostname()).encode()
+            + b',"created_at":"2026-09-13T00:00:00+00:00"}'
+        ),
+        json.dumps(
+            {
+                "pid": 10**100,
+                "host": socket.gethostname(),
+                "created_at": "2026-09-13T00:00:00+00:00",
+            }
+        ).encode(),
+    ]
 
-    with (
-        pytest.raises(YbsError, match="task lock unavailable") as exc_info,
-        task_lock(tmp_path, "DEMO-101"),
-    ):
-        pass
+    for original_bytes in unavailable_records:
+        lock_path.write_bytes(original_bytes)
 
-    assert exc_info.value.code == 5
-    assert lock_path.read_bytes() == b"not-json"
+        with (
+            pytest.raises(YbsError, match="task lock unavailable") as exc_info,
+            task_lock(tmp_path, "DEMO-101"),
+        ):
+            pass
+
+        assert exc_info.value.code == 5
+        assert lock_path.read_bytes() == original_bytes
 
 
 def test_task_lock_never_recovers_invalid_timestamp_metadata(

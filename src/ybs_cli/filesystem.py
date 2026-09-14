@@ -274,7 +274,7 @@ def _recover_dead_local_owner(directory_descriptor: int, lock_name: str) -> bool
     try:
         observed_bytes, observed_identity = _read_file_at(directory_descriptor, lock_name)
         metadata = json.loads(observed_bytes)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+    except (OSError, RecursionError, UnicodeDecodeError, ValueError):
         return False
 
     if not _valid_lock_metadata(metadata) or metadata["host"] != socket.gethostname():
@@ -284,7 +284,7 @@ def _recover_dead_local_owner(directory_descriptor: int, lock_name: str) -> bool
         os.kill(metadata["pid"], 0)
     except ProcessLookupError:
         pass
-    except (PermissionError, OSError):
+    except (PermissionError, OSError, OverflowError):
         return False
     else:
         return False
